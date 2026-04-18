@@ -52,6 +52,46 @@
 
         <div class="mt-8 rounded-xl border border-slate-600/60 bg-slate-900/40 p-4">
           <h2 class="text-lg font-semibold">
+            <i class="fa-solid fa-tablet-screen-button mr-2 text-amber-400"></i>Kindle storage
+          </h2>
+          <p class="mt-1 text-xs text-slate-400">
+            Polled over SSH from <code class="text-slate-300">/status</code> (same data as
+            <code class="text-slate-300">GET /kindle-stats</code>). Set <code class="text-slate-300">KINDLE_IP</code> in
+            the container env to enable the background poller.
+          </p>
+          <div class="mt-4 grid gap-2 text-sm">
+            <p>
+              <span class="font-semibold">State:</span>
+              <span id="kindleStatusPill" class="ml-1 inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium">—</span>
+              <span class="ml-2 text-slate-400" id="kindleReachableLine"></span>
+            </p>
+            <p><span class="font-semibold">Last checked (UTC):</span> <span id="kindleLastChecked">—</span></p>
+            <p><span class="font-semibold">SSH path:</span> <span id="kindleStoragePath" class="break-all">—</span></p>
+            <div class="mt-2">
+              <div class="flex justify-between text-xs text-slate-400">
+                <span>User data vs partition total</span>
+                <span id="kindleUsePercentLabel">—</span>
+              </div>
+              <div class="mt-1 h-2.5 w-full overflow-hidden rounded-full bg-slate-700">
+                <div
+                  id="kindleUseBar"
+                  class="h-full rounded-full bg-amber-500 transition-[width] duration-500"
+                  style="width: 0%"
+                ></div>
+              </div>
+            </div>
+            <div class="mt-2 grid gap-1 sm:grid-cols-2">
+              <p><span class="font-semibold">Total:</span> <span id="kindleTotalGb">—</span></p>
+              <p><span class="font-semibold">Free:</span> <span id="kindleAvailGb">—</span></p>
+              <p><span class="font-semibold">User content (du):</span> <span id="kindleUserGb">—</span></p>
+              <p><span class="font-semibold">Partition used (df):</span> <span id="kindlePartitionGb">—</span></p>
+            </div>
+            <p class="text-slate-300"><span class="font-semibold">Note:</span> <span id="kindleDetailMessage">—</span></p>
+          </div>
+        </div>
+
+        <div class="mt-8 rounded-xl border border-slate-600/60 bg-slate-900/40 p-4">
+          <h2 class="text-lg font-semibold">
             <i class="fa-solid fa-list-ul mr-2 text-violet-400"></i>Downloaded books by series
           </h2>
           <p id="booksBySeriesSummary" class="mt-2 text-xs text-slate-400">Loading…</p>
@@ -72,6 +112,71 @@
     </main>
 
     <script>
+      function formatGb(val) {
+        if (val === null || val === undefined || Number.isNaN(Number(val))) return "—";
+        return `${Number(val).toFixed(2)} GB`;
+      }
+
+      function updateKindleStats(ks) {
+        ks = ks || {};
+        const pill = document.getElementById("kindleStatusPill");
+        const last = document.getElementById("kindleLastChecked");
+        const pathEl = document.getElementById("kindleStoragePath");
+        const reachLine = document.getElementById("kindleReachableLine");
+        const bar = document.getElementById("kindleUseBar");
+        const pctLabel = document.getElementById("kindleUsePercentLabel");
+        const totalEl = document.getElementById("kindleTotalGb");
+        const freeEl = document.getElementById("kindleAvailGb");
+        const userEl = document.getElementById("kindleUserGb");
+        const partEl = document.getElementById("kindlePartitionGb");
+        const msgEl = document.getElementById("kindleDetailMessage");
+        if (!pill || !msgEl) return;
+
+        const status = ks.status || "Unknown";
+        const basePill = "ml-1 inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium";
+        let pillClass = `${basePill} bg-slate-600 text-slate-100`;
+        if (status === "Online") pillClass = `${basePill} bg-emerald-600/90 text-white`;
+        else if (status === "Offline") pillClass = `${basePill} bg-amber-600/90 text-white`;
+        else if (status === "Not configured") pillClass = `${basePill} bg-slate-600 text-slate-200`;
+        else if (status === "Error") pillClass = `${basePill} bg-rose-600/90 text-white`;
+        pill.className = pillClass;
+        pill.textContent = status;
+
+        if (last) last.textContent = ks.last_checked || "—";
+        if (pathEl) pathEl.textContent = ks.storage_path || "—";
+
+        if (reachLine) {
+          if (ks.reachable === true) {
+            const m = ks.reachability_method ? String(ks.reachability_method) : "";
+            reachLine.textContent = m ? `Reachable (${m})` : "Reachable";
+            reachLine.className = "ml-2 text-emerald-400/90";
+          } else if (ks.reachable === false) {
+            reachLine.textContent = "Not reachable";
+            reachLine.className = "ml-2 text-amber-400/90";
+          } else {
+            reachLine.textContent = "";
+            reachLine.className = "ml-2 text-slate-400";
+          }
+        }
+
+        const pct =
+          typeof ks.storage_use_percent === "number" && !Number.isNaN(ks.storage_use_percent)
+            ? Math.min(100, Math.max(0, ks.storage_use_percent))
+            : null;
+        if (bar) bar.style.width = pct === null ? "0%" : `${pct}%`;
+        if (pctLabel) {
+          if (pct === null) pctLabel.textContent = "—";
+          else pctLabel.textContent = `${pct}% of partition (user folder)`;
+        }
+
+        if (totalEl) totalEl.textContent = formatGb(ks.storage_total_gb);
+        if (freeEl) freeEl.textContent = formatGb(ks.storage_available_gb);
+        if (userEl) userEl.textContent = formatGb(ks.user_content_used_gb ?? ks.storage_used_gb);
+        if (partEl) partEl.textContent = formatGb(ks.partition_used_gb);
+
+        msgEl.textContent = ks.message || "—";
+      }
+
       function formatKomgaCounts(k) {
         const c = (k && k.counts) || {};
         const lib = c.libraries ?? 0;
@@ -126,6 +231,8 @@
           (komga.in_progress ? "Refresh in progress…" : "") ||
           data.message ||
           "Ready. Use Download from Komga to start.";
+
+        updateKindleStats(data.kindle_stats);
 
         const dlBtn = document.getElementById("komgaDownloadBtn");
         if (dlBtn) {

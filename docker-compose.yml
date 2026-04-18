@@ -15,6 +15,8 @@ services:
       APP_LOG_FILE: /data/komga/app.log
     volumes:
       - komga_catalog_data:/data/komga
+      # Optional: mount host keys for SSH_KEY_PATH=/app/keys/your_key
+      - ./keys:/app/keys:ro
 
   komga-library-cron:
     image: alpine:3.20

@@ -1,0 +1,15 @@
+---
+description: After any change that affects the running stack, rebuild and restart Docker Compose.
+alwaysApply: true
+---
+
+# Docker Compose — always restart after relevant edits
+
+This app is normally run via `docker compose` in the repo root.
+
+Whenever you change anything that affects the running container (including but not limited to `Dockerfile`, `docker-compose.yml`, `app/`, `static/`, `.env` values loaded by Compose, or `requirements.txt`), **before you finish the task**:
+
+1. Run from the project root: `docker compose up -d --build`
+2. Confirm the command succeeded (containers recreated/started as needed).
+
+Do not assume the user will restart manually; apply the new code and env by recreating the service yourself.

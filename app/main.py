@@ -3,9 +3,12 @@ import email.message
 import json
 import logging
 import os
+import re
 import shutil
+import subprocess
+import tempfile
 import threading
-from contextlib import asynccontextmanager
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -86,11 +89,6 @@ def _install_app_logging_handlers() -> None:
     root.addHandler(_mem_log_handler)
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI):
-    _install_app_logging_handlers()
-    yield
-
 KOMGA_SOURCE_DIR = os.getenv("KOMGA_SOURCE_DIR", "")
 KOMGA_BASE_URL = os.getenv("KOMGA_BASE_URL", "")
 KOMGA_USERNAME = os.getenv("KOMGA_USERNAME", "")
@@ -113,6 +111,23 @@ KOMGA_BINARIES_SKIP_UNCHANGED = os.getenv("KOMGA_BINARIES_SKIP_UNCHANGED", "true
     "yes",
 )
 KOMGA_FILE_DOWNLOAD_TIMEOUT = max(60, int(os.getenv("KOMGA_FILE_DOWNLOAD_TIMEOUT", "600")))
+
+KINDLE_IP = os.getenv("KINDLE_IP", "").strip()
+KINDLE_USER = os.getenv("KINDLE_USER", "root")
+DEST_DIR = os.getenv("DEST_DIR", "/mnt/us/documents")
+SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "").strip()
+SSH_TIMEOUT_SECONDS = int(os.getenv("SSH_TIMEOUT_SECONDS", "12"))
+# Kindle SSH is often dropbear with an empty root password when no key is configured.
+if "KINDLE_PASSWORD" in os.environ:
+    SSH_PASSWORD: str | None = os.environ["KINDLE_PASSWORD"]
+elif SSH_KEY_PATH:
+    SSH_PASSWORD = None
+elif KINDLE_IP:
+    SSH_PASSWORD = ""
+else:
+    SSH_PASSWORD = None
+KINDLE_STATS_INTERVAL_SECONDS = max(5, int(os.getenv("KINDLE_STATS_INTERVAL_SECONDS", "30")))
+_ASKPASS_SCRIPT_PATH: str | None = None
 
 
 def _default_komga_library_db_path() -> Path:
@@ -138,7 +153,7 @@ def _default_komga_binaries_dir() -> Path:
 
 KOMGA_BINARIES_DIR = _default_komga_binaries_dir()
 
-app = FastAPI(title="Komga Library Pull", lifespan=_lifespan)
+app = FastAPI(title="Komga Library Pull")
 komga_db_lock = threading.Lock()
 komga_refresh_lock = threading.Lock()
 komga_library_refresh_in_progress = False
@@ -159,8 +174,255 @@ komga_library_db_summary: dict[str, Any] = {
     "on_disk_books_with_media": None,
 }
 
+kindle_stats_lock = threading.Lock()
+kindle_stats: dict[str, Any] = {
+    "status": "Unknown",
+    "last_checked": None,
+    "reachable": False,
+    "reachability_method": "none",
+    "storage_path": DEST_DIR,
+    "storage_total_gb": None,
+    "storage_used_gb": None,
+    "user_content_used_gb": None,
+    "partition_used_gb": None,
+    "storage_available_gb": None,
+    "storage_use_percent": None,
+    "message": "Kindle stats poller not started (set KINDLE_IP).",
+}
+
 logger = logging.getLogger("komga-pull")
 logger.setLevel(logging.INFO)
+
+
+def _ssh_base_command() -> list[str]:
+    use_password_auth = SSH_PASSWORD is not None
+    command = [
+        "ssh",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-o",
+        "BatchMode=no" if use_password_auth else "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+    ]
+    if use_password_auth:
+        command.extend(
+            [
+                "-o",
+                "PasswordAuthentication=yes",
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "PreferredAuthentications=password",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "PreferredAuthentications=publickey",
+                "-o",
+                "IdentitiesOnly=yes",
+            ]
+        )
+    if SSH_KEY_PATH and not use_password_auth:
+        command.extend(["-i", SSH_KEY_PATH])
+    command.append(f"{KINDLE_USER}@{KINDLE_IP}")
+    return command
+
+
+def _prepare_askpass_script() -> str:
+    global _ASKPASS_SCRIPT_PATH
+    if _ASKPASS_SCRIPT_PATH:
+        return _ASKPASS_SCRIPT_PATH
+    askpass_file = tempfile.NamedTemporaryFile(prefix="kindle_askpass_", delete=False, mode="w", encoding="utf-8")
+    askpass_file.write("#!/bin/sh\n")
+    askpass_file.write('printf "%s" "$KINDLE_PASSWORD"\n')
+    askpass_file.close()
+    os.chmod(askpass_file.name, 0o700)
+    _ASKPASS_SCRIPT_PATH = askpass_file.name
+    return _ASKPASS_SCRIPT_PATH
+
+
+def _ssh_subprocess_env() -> dict[str, str] | None:
+    if SSH_PASSWORD is None:
+        return None
+    env = os.environ.copy()
+    env["KINDLE_PASSWORD"] = SSH_PASSWORD
+    env["SSH_ASKPASS"] = _prepare_askpass_script()
+    env["SSH_ASKPASS_REQUIRE"] = "force"
+    env.setdefault("DISPLAY", "dummy:0")
+    return env
+
+
+def _ssh_probe_kindle() -> bool:
+    if not KINDLE_IP:
+        return False
+    result = subprocess.run(
+        _ssh_base_command() + ["true"],
+        capture_output=True,
+        text=True,
+        env=_ssh_subprocess_env(),
+        timeout=SSH_TIMEOUT_SECONDS,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _is_kindle_reachable() -> tuple[bool, str]:
+    if _ssh_probe_kindle():
+        return True, "ssh"
+    return False, "none"
+
+
+def _collect_kindle_stats() -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    if not KINDLE_IP:
+        return {
+            "status": "Not configured",
+            "last_checked": now,
+            "reachable": False,
+            "reachability_method": "none",
+            "storage_path": DEST_DIR,
+            "storage_total_gb": None,
+            "storage_used_gb": None,
+            "user_content_used_gb": None,
+            "partition_used_gb": None,
+            "storage_available_gb": None,
+            "storage_use_percent": None,
+            "message": "Set KINDLE_IP for storage stats (SSH uses an empty password by default when SSH_KEY_PATH is unset; set KINDLE_PASSWORD or SSH_KEY_PATH to override).",
+        }
+
+    reachable, method = _is_kindle_reachable()
+    base: dict[str, Any] = {
+        "status": "Offline",
+        "last_checked": now,
+        "reachable": reachable,
+        "reachability_method": method,
+        "storage_path": DEST_DIR,
+        "storage_total_gb": None,
+        "storage_used_gb": None,
+        "user_content_used_gb": None,
+        "partition_used_gb": None,
+        "storage_available_gb": None,
+        "storage_use_percent": None,
+        "message": "Kindle is not reachable via SSH.",
+    }
+    if not reachable:
+        return base
+
+    ssh_cmd = _ssh_base_command() + [f'df -k "{DEST_DIR}"']
+    result = subprocess.run(
+        ssh_cmd,
+        capture_output=True,
+        text=True,
+        env=_ssh_subprocess_env(),
+        timeout=SSH_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if result.returncode != 0:
+        base["status"] = "Error"
+        base["message"] = f"SSH df failed: {result.stderr.strip()}"
+        return base
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        base["status"] = "Error"
+        base["message"] = "Unexpected df output; cannot parse Kindle storage stats."
+        return base
+
+    parts = re.split(r"\s+", lines[-1])
+    if len(parts) < 5:
+        base["status"] = "Error"
+        base["message"] = "Malformed df output; expected total/used/available/percent columns."
+        return base
+
+    try:
+        total_kb = int(parts[1])
+        partition_used_kb = int(parts[2])
+        available_kb = int(parts[3])
+    except ValueError:
+        base["status"] = "Error"
+        base["message"] = "Unable to convert Kindle storage totals."
+        return base
+
+    du_cmd = _ssh_base_command() + [f'du -sk "{DEST_DIR}"']
+    du_result = subprocess.run(
+        du_cmd,
+        capture_output=True,
+        text=True,
+        env=_ssh_subprocess_env(),
+        timeout=SSH_TIMEOUT_SECONDS,
+        check=False,
+    )
+    user_used_kb: int | None = None
+    if du_result.returncode == 0:
+        du_lines = [line.strip() for line in du_result.stdout.splitlines() if line.strip()]
+        if du_lines:
+            du_parts = re.split(r"\s+", du_lines[0], maxsplit=1)
+            if du_parts:
+                try:
+                    user_used_kb = int(du_parts[0])
+                except ValueError:
+                    user_used_kb = None
+
+    if user_used_kb is None:
+        base["status"] = "Error"
+        base["message"] = "Unable to read user storage usage from destination path (du)."
+        return base
+
+    user_use_percent = round((user_used_kb / total_kb) * 100) if total_kb > 0 else 0
+
+    base.update(
+        {
+            "status": "Online",
+            "storage_total_gb": round(total_kb / (1024 * 1024), 2),
+            "storage_used_gb": round(user_used_kb / (1024 * 1024), 2),
+            "user_content_used_gb": round(user_used_kb / (1024 * 1024), 2),
+            "partition_used_gb": round(partition_used_kb / (1024 * 1024), 2),
+            "storage_available_gb": round(available_kb / (1024 * 1024), 2),
+            "storage_use_percent": user_use_percent,
+            "message": "Kindle stats refreshed (user content = du on DEST_DIR; partition = df used).",
+        }
+    )
+    return base
+
+
+def _kindle_stats_poller() -> None:
+    while True:
+        try:
+            snapshot = _collect_kindle_stats()
+        except Exception as exc:  # noqa: BLE001
+            snapshot = {
+                "status": "Error",
+                "last_checked": datetime.now(timezone.utc).isoformat(),
+                "reachable": False,
+                "reachability_method": "none",
+                "storage_path": DEST_DIR,
+                "storage_total_gb": None,
+                "storage_used_gb": None,
+                "user_content_used_gb": None,
+                "partition_used_gb": None,
+                "storage_available_gb": None,
+                "storage_use_percent": None,
+                "message": f"Stats poll failed: {exc}",
+            }
+            logger.exception("Unhandled Kindle stats polling error")
+        with kindle_stats_lock:
+            kindle_stats.update(snapshot)
+        time.sleep(KINDLE_STATS_INTERVAL_SECONDS)
 
 
 def _komga_headers() -> dict[str, str]:
@@ -893,6 +1155,12 @@ def _startup_background_workers() -> None:
         elif not _spawn_komga_refresh_thread_if_possible():
             logger.warning("Komga library refresh on start skipped: a refresh is already running.")
 
+    if KINDLE_IP:
+        threading.Thread(target=_kindle_stats_poller, daemon=True).start()
+    else:
+        with kindle_stats_lock:
+            kindle_stats["message"] = "Set KINDLE_IP to enable background Kindle storage polling."
+
 
 @app.get("/")
 def dashboard() -> FileResponse:
@@ -906,11 +1174,20 @@ def get_status() -> dict[str, Any]:
             "in_progress": komga_library_refresh_in_progress,
             **komga_library_db_summary,
         }
+    with kindle_stats_lock:
+        ks = dict(kindle_stats)
     return {
         "in_progress": komga_library_refresh_in_progress,
         "komga_library": komga,
+        "kindle_stats": ks,
         "message": "Download books from Komga into this container via POST /komga/library/refresh.",
     }
+
+
+@app.get("/kindle-stats")
+def get_kindle_stats() -> dict[str, Any]:
+    with kindle_stats_lock:
+        return dict(kindle_stats)
 
 
 @app.post("/komga/library/refresh")
