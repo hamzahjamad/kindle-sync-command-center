@@ -1,0 +1,20 @@
+---
+description: Rebuild Docker images after container-related code or config changes
+alwaysApply: true
+---
+
+# Docker rebuild (this repo)
+
+When you change anything that affects the running container image or Compose stack—`Dockerfile`, `docker-compose.yml`, `.dockerignore`, `requirements.txt`, `app/`, or `static/`—finish the task by running from the project root:
+
+```bash
+docker compose build
+```
+
+If the user is running the stack and needs the new image applied, follow with:
+
+```bash
+docker compose up -d
+```
+
+Do not wait for the user to ask for a rebuild; run the build (and `up -d` when appropriate) as part of the same turn unless they are in ask-only mode or Docker is unavailable.

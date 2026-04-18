@@ -3,43 +3,66 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Kindle Sync Command Center</title>
+    <title>Komga Library Pull</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+    />
   </head>
   <body class="min-h-screen bg-slate-900 text-slate-100">
-    <main class="mx-auto max-w-2xl p-6">
+    <main class="mx-auto max-w-3xl p-6">
       <div class="rounded-2xl bg-slate-800 p-6 shadow-xl">
-        <h1 class="text-2xl font-bold">Kindle Sync Command Center</h1>
+        <h1 class="text-2xl font-bold">Komga Library Pull</h1>
         <p class="mt-2 text-sm text-slate-300">
-          Trigger sync and monitor Kindle health from one page.
+          Download your Komga catalog and book files into this container’s data volume.
         </p>
 
-        <div class="mt-6 flex items-center gap-3">
+        <div class="mt-6 flex flex-wrap items-center gap-3">
           <button
-            id="syncBtn"
-            class="rounded-xl bg-emerald-500 px-4 py-2 font-semibold text-slate-900 transition hover:bg-emerald-400"
+            type="button"
+            id="komgaDownloadBtn"
+            class="inline-flex items-center rounded-lg bg-cyan-600 px-4 py-2 text-sm font-semibold text-white hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Sync Now
+            <i class="fa-solid fa-cloud-arrow-down mr-2"></i>Download from Komga
           </button>
-          <span id="syncResponse" class="text-sm text-slate-300"></span>
+          <span id="actionHint" class="text-sm text-slate-300">Idle.</span>
         </div>
+        <p class="mt-2 text-xs text-slate-400">
+          Writes one JSON catalog snapshot and, when enabled, each book as <code class="text-slate-300">media.&lt;ext&gt;</code>
+          under the binaries directory (titles in the list view come from the snapshot).
+        </p>
 
-        <div class="mt-8">
-          <h2 class="text-lg font-semibold">Storage</h2>
-          <div class="mt-3 h-4 w-full rounded-full bg-slate-700">
-            <div id="storageBar" class="h-4 rounded-full bg-cyan-400" style="width: 0%"></div>
+        <div class="mt-8 rounded-xl border border-slate-600/60 bg-slate-900/40 p-4">
+          <h2 class="text-lg font-semibold"><i class="fa-solid fa-database mr-2 text-cyan-400"></i>Status</h2>
+          <div class="mt-4 grid gap-2 text-sm">
+            <p><span class="font-semibold">Snapshot file:</span> <span id="komgaDbPath" class="break-all">-</span></p>
+            <p><span class="font-semibold">Binaries dir:</span> <span id="komgaBinPath" class="break-all">-</span></p>
+            <p><span class="font-semibold">Last completed pull:</span> <span id="komgaLastFetch">-</span></p>
+            <p>
+              <span class="font-semibold">Counts:</span>
+              <span id="komgaCounts">libraries 0 · series 0 · books 0</span>
+            </p>
+            <p><span class="font-semibold">Files on disk:</span> <span id="komgaOnDisk">-</span></p>
+            <p><span class="font-semibold">Last download job:</span> <span id="komgaBinaryStats">-</span></p>
+            <p><span class="font-semibold">Job:</span> <span id="komgaRefreshState">Idle</span></p>
+            <p><span class="font-semibold">Message:</span> <span id="komgaMessage">-</span></p>
           </div>
-          <p id="storageText" class="mt-2 text-sm text-slate-300">No data yet.</p>
         </div>
 
-        <div class="mt-8 grid gap-2 text-sm">
-          <p><span class="font-semibold">Status:</span> <span id="status">Unknown</span></p>
-          <p><span class="font-semibold">Last Run:</span> <span id="lastRun">-</span></p>
-          <p><span class="font-semibold">Message:</span> <span id="message">-</span></p>
+        <div class="mt-8 rounded-xl border border-slate-600/60 bg-slate-900/40 p-4">
+          <h2 class="text-lg font-semibold">
+            <i class="fa-solid fa-list-ul mr-2 text-violet-400"></i>Downloaded books by series
+          </h2>
+          <p id="booksBySeriesSummary" class="mt-2 text-xs text-slate-400">Loading…</p>
+          <div id="booksBySeriesWrap" class="mt-3 max-h-[28rem] overflow-y-auto"></div>
         </div>
 
         <div class="mt-8">
-          <h2 class="text-lg font-semibold">Recent Logs</h2>
+          <h2 class="text-lg font-semibold">Recent activity</h2>
+          <p class="mt-1 text-xs text-slate-400">
+            Last 100 lines from this process (in-memory + <code class="text-slate-300">APP_LOG_FILE</code> when set).
+          </p>
           <pre
             id="logs"
             class="mt-3 max-h-80 overflow-auto rounded-lg bg-slate-900 p-3 text-xs text-slate-300"
@@ -49,23 +72,68 @@
     </main>
 
     <script>
-      const maxStorageForBar = 8; // Adjust this to your Kindle capacity in GB.
+      function formatKomgaCounts(k) {
+        const c = (k && k.counts) || {};
+        const lib = c.libraries ?? 0;
+        const ser = c.series ?? 0;
+        const books = c.books ?? 0;
+        return `libraries ${lib} · series ${ser} · books ${books}`;
+      }
+
+      function formatOnDisk(k) {
+        const n = k && k.on_disk_books_with_media;
+        if (n === undefined || n === null) return "—";
+        return `${n} book folders with a media file (what the series list is built from).`;
+      }
+
+      function formatKomgaBinaryStats(k) {
+        if (k && k.in_progress && k.binary_pull_progress) {
+          const p = k.binary_pull_progress;
+          if (p.phase === "catalog") {
+            return "Fetching catalog…";
+          }
+          if (p.phase === "binaries") {
+            return `${p.processed}/${p.total} books processed · ${p.downloaded} newly written · ${p.skipped} skipped · ${p.failed} errors`;
+          }
+        }
+        const bp = (k && k.binary_pull) || {};
+        if (bp.enabled === false) {
+          return "downloads disabled (metadata only)";
+        }
+        const d = bp.downloaded;
+        const s = bp.skipped;
+        const f = bp.failed;
+        if (d == null && s == null && f == null) {
+          return "—";
+        }
+        return `${d ?? "—"} newly written this run · ${s ?? "—"} skipped (unchanged on disk or filtered) · ${f ?? "—"} HTTP/network errors`;
+      }
 
       async function refreshStatus() {
         const res = await fetch("/status");
         const data = await res.json();
+        const komga = data.komga_library || {};
 
-        document.getElementById("status").textContent = data.in_progress
-          ? `${data.status} (Running...)`
-          : data.status;
-        document.getElementById("lastRun").textContent = data.last_run || "-";
-        document.getElementById("message").textContent = data.message || "-";
+        document.getElementById("komgaDbPath").textContent = komga.db_path || "-";
+        document.getElementById("komgaBinPath").textContent = komga.binaries_path || "-";
+        document.getElementById("komgaLastFetch").textContent = komga.last_fetched_at || "-";
+        document.getElementById("komgaCounts").textContent = formatKomgaCounts(komga);
+        document.getElementById("komgaOnDisk").textContent = formatOnDisk(komga);
+        document.getElementById("komgaBinaryStats").textContent = formatKomgaBinaryStats(komga);
+        document.getElementById("komgaRefreshState").textContent = komga.in_progress ? "Running…" : "Idle";
+        document.getElementById("komgaMessage").textContent =
+          komga.last_error ||
+          (komga.in_progress ? "Refresh in progress…" : "") ||
+          data.message ||
+          "Ready. Use Download from Komga to start.";
 
-        if (data.remaining_storage_gb !== null && data.remaining_storage_gb !== undefined) {
-          const pct = Math.max(0, Math.min(100, (data.remaining_storage_gb / maxStorageForBar) * 100));
-          document.getElementById("storageBar").style.width = `${pct}%`;
-          document.getElementById("storageText").textContent =
-            `${data.remaining_storage_gb} GB remaining`;
+        const dlBtn = document.getElementById("komgaDownloadBtn");
+        if (dlBtn) {
+          dlBtn.disabled = Boolean(data.in_progress);
+        }
+        const hint = document.getElementById("actionHint");
+        if (hint) {
+          hint.textContent = data.in_progress ? "Download in progress…" : "Idle.";
         }
       }
 
@@ -75,16 +143,122 @@
         document.getElementById("logs").textContent = (data.lines || []).join("\n");
       }
 
-      document.getElementById("syncBtn").addEventListener("click", async () => {
-        const res = await fetch("/sync", { method: "POST" });
-        const data = await res.json();
-        document.getElementById("syncResponse").textContent = `Response: ${data.status}`;
-        await refreshStatus();
-      });
+      function formatMb(bytes) {
+        if (bytes == null || Number.isNaN(Number(bytes))) return "";
+        return `${(Number(bytes) / (1024 * 1024)).toFixed(2)} MB`;
+      }
+
+      function formatSeriesDownloadLabel(s) {
+        const disk = s.on_disk_book_count ?? (s.books || []).length;
+        const cat = s.catalog_book_count;
+        const p = s.download_percent;
+        if (typeof cat === "number" && cat > 0 && typeof p === "number") {
+          return `${p}% (${disk}/${cat})`;
+        }
+        if (typeof cat === "number" && cat > 0) {
+          return `${disk}/${cat}`;
+        }
+        return `${disk} on disk`;
+      }
+
+      async function refreshBooksBySeries() {
+        const wrap = document.getElementById("booksBySeriesWrap");
+        const summaryEl = document.getElementById("booksBySeriesSummary");
+        if (!wrap || !summaryEl) return;
+        try {
+          const res = await fetch("/komga/library/books-by-series");
+          const data = await res.json();
+          const extra = data.message ? ` — ${data.message}` : "";
+          const ov = data.overall_download_percent;
+          const catAll = data.catalog_book_total;
+          const ovPart =
+            typeof ov === "number" && typeof catAll === "number" && catAll > 0
+              ? ` · overall ${ov}% (${data.total_books ?? 0}/${catAll} vs catalog)`
+              : "";
+          summaryEl.textContent = `${data.total_series ?? 0} series · ${data.total_books ?? 0} files on disk${ovPart}${extra}`;
+          const series = data.series || [];
+          wrap.textContent = "";
+          if (!series.length) {
+            const p = document.createElement("p");
+            p.className = "mt-2 text-sm text-slate-400";
+            p.textContent = data.message
+              ? String(data.message)
+              : "No downloaded book files yet. Run Download from Komga first.";
+            wrap.appendChild(p);
+            return;
+          }
+          for (const s of series) {
+            const det = document.createElement("details");
+            det.className =
+              "mt-2 rounded-lg border border-slate-600/50 bg-slate-950/40 open:bg-slate-900/50";
+            const sum = document.createElement("summary");
+            sum.className =
+              "cursor-pointer select-none px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-800/80";
+            const icon = document.createElement("i");
+            icon.className = "fa-solid fa-layer-group mr-2 text-violet-400";
+            sum.appendChild(icon);
+            const lib = s.libraryName ? `${s.libraryName} · ` : "";
+            const pct = formatSeriesDownloadLabel(s);
+            sum.appendChild(
+              document.createTextNode(`${lib}${s.name || s.id} — ${pct}`)
+            );
+            det.appendChild(sum);
+            const ul = document.createElement("ul");
+            ul.className = "space-y-1 border-t border-slate-600/40 px-3 py-2 text-sm";
+            for (const b of s.books || []) {
+              const li = document.createElement("li");
+              li.className = "text-slate-300";
+              const ext = b.extension ? `.${b.extension}` : "";
+              const mb = formatMb(b.size_bytes);
+              const sizePart = mb ? ` · ${mb}` : "";
+              li.textContent = `${b.title}${ext} — ${b.id}${sizePart}`;
+              ul.appendChild(li);
+            }
+            det.appendChild(ul);
+            wrap.appendChild(det);
+          }
+        } catch (e) {
+          summaryEl.textContent = "Could not load list.";
+          wrap.textContent = "";
+          const p = document.createElement("p");
+          p.className = "text-sm text-rose-400";
+          p.textContent = String(e);
+          wrap.appendChild(p);
+        }
+      }
 
       async function tick() {
-        await Promise.all([refreshStatus(), refreshLogs()]);
+        await Promise.all([refreshStatus(), refreshLogs(), refreshBooksBySeries()]);
       }
+
+      document.getElementById("komgaDownloadBtn").addEventListener("click", async () => {
+        const btn = document.getElementById("komgaDownloadBtn");
+        btn.disabled = true;
+        try {
+          const res = await fetch("/komga/library/refresh", { method: "POST" });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const d = body.detail;
+            document.getElementById("komgaMessage").textContent =
+              typeof d === "string"
+                ? d
+                : Array.isArray(d)
+                  ? d.map((x) => (x && x.msg) || JSON.stringify(x)).join("; ")
+                  : d
+                    ? JSON.stringify(d)
+                    : `HTTP ${res.status}`;
+          } else if (body.status === "already_running") {
+            document.getElementById("komgaMessage").textContent = "A download is already running.";
+          } else {
+            document.getElementById("komgaMessage").textContent = "Download started.";
+          }
+        } catch (e) {
+          document.getElementById("komgaMessage").textContent = String(e);
+        } finally {
+          btn.disabled = false;
+          await refreshStatus();
+        }
+      });
 
       tick();
       setInterval(tick, 5000);
