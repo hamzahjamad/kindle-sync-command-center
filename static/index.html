@@ -29,7 +29,10 @@
           <span id="actionHint" class="text-sm text-slate-300">Idle.</span>
         </div>
         <p class="mt-2 text-xs text-slate-400">
-          Writes one JSON catalog snapshot and, when enabled, each book as <code class="text-slate-300">media.&lt;ext&gt;</code>
+          Writes one JSON catalog snapshot and, when enabled, each book under slug folders
+          (<code class="text-slate-300">Library/Series/Chapter/</code>) with Komga ids in
+          <code class="text-slate-300">.komga.json</code>, plus a sortable file
+          (<code class="text-slate-300">00042 - Title.ext</code> for KOReader unless disabled in env).
           under the binaries directory (titles in the list view come from the snapshot).
         </p>
 
